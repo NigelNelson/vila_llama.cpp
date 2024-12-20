@@ -163,6 +163,7 @@ enum projector_type {
     PROJECTOR_TYPE_LDP,
     PROJECTOR_TYPE_LDPV2,
     PROJECTOR_TYPE_RESAMPLER,
+    PROJECTOR_TYPE_MLP_DOWNSAMPLE,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -171,6 +172,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_LDP, "ldp" },
     { PROJECTOR_TYPE_LDPV2, "ldpv2"},
     { PROJECTOR_TYPE_RESAMPLER, "resampler"},
+    { PROJECTOR_TYPE_MLP_DOWNSAMPLE, "mlp_downsample"},
 };
 
 
@@ -823,6 +825,72 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_4_w),
                                 model.mm_4_b);
         }
+        else if (ctx->proj_type == PROJECTOR_TYPE_MLP_DOWNSAMPLE) {
+            // First reshape the embeddings into a square grid
+            int h = sqrt(embeddings->ne[1]); // ne[1] is num_patches
+            int w = h;
+            int c = embeddings->ne[2];
+            // block_1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
+
+            // ne reshape [channels, patches, batch] -> [channels, h, w, batch]
+            // torch reshape [batch, patches channels] -> [batch, w, h, channels]
+            embeddings = ggml_reshape_4d(ctx0, embeddings, embeddings->ne[0], h, w, embeddings->ne[2]);
+
+            // Handle odd dimensions by padding if necessary
+            if (w % 2 == 1) {
+                // Add padding for odd width
+                struct ggml_tensor * pad_w = ggml_new_tensor_4d(ctx0, embeddings->type,
+                    embeddings->ne[0], embeddings->ne[1], 1, embeddings->ne[3]);
+                embeddings = ggml_concat(ctx0, embeddings, pad_w, 2);
+                w += 1;
+            }
+            if (h % 2 == 1) {
+                // Add padding for odd height
+                struct ggml_tensor * pad_h = ggml_new_tensor_4d(ctx0, embeddings->type, 
+                    embeddings->ne[0], 1, embeddings->ne[2], embeddings->ne[3]);
+                embeddings = ggml_concat(ctx0, embeddings, pad_h, 1);
+                h += 1;
+            }
+
+            // Reshape and permute to combine 2x2 blocks
+            // First combine width dimension
+
+            // ne reshape [channels, h, w, batch] -> [channels*2, h/2, w, batch]
+            // torch reshape [batch, w, h, channels] -> [batch, w, h/2, channels*2]
+            embeddings = ggml_reshape_4d(ctx0, embeddings, 
+                embeddings->ne[0]*2, h/2, w, embeddings->ne[3]);
+            // ne reshape [channels*2, h/2, w, batch] -> [channels*2, w, h/2, batch]
+            // torch reshape [batch, w, h/2, channels*2] -> [batch, h/2, w, channels*2]
+            embeddings = ggml_cont(ctx0, ggml_permute(ctx0, embeddings, 0, 2, 1, 3));
+
+
+            // Then combine height dimension
+
+            // ne reshape [channels*2, w, h/2, batch] -> [channels*4, w/2, h/2, batch]
+            // torch reshape [batch, h/2, w, channels*2] -> [batch, h/2, w/2, channels*4]
+            embeddings = ggml_reshape_4d(ctx0, embeddings,
+                embeddings->ne[0]*4, h/2, w/2, embeddings->ne[3]);
+            // ne reshape [channels*4, w/2, h/2, batch] -> [channels*4, h/2, w/2, batch]
+            // torch reshape [batch, h/2, w/2, channels*4] -> [batch, w/2, h/2, channels*4]
+            embeddings = ggml_cont(ctx0, ggml_permute(ctx0, embeddings, 0, 2, 1, 3));
+
+            // Flatten back to [batch, patches, channels]
+            embeddings = ggml_reshape_3d(ctx0, embeddings, 
+                embeddings->ne[0], (h/2) * (w/2), embeddings->ne[3]);
+
+            // Layer Normalization (layer 1)
+            embeddings = ggml_norm(ctx0, embeddings, eps);
+            embeddings = ggml_mul(ctx0, embeddings, model.mm_1_w);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_1_b);
+
+            embeddings = ggml_gelu(ctx0, embeddings);
+            embeddings = ggml_mul_mat(ctx0, model.mm_2_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_2_b);
+
+            embeddings = ggml_gelu(ctx0, embeddings);
+            embeddings = ggml_mul_mat(ctx0, model.mm_4_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_4_b);
+        }
         else if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
             // MobileVLM projector
             int n_patch = 24;
@@ -1396,9 +1464,11 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         }
 
         // LLaVA projection
-        if (new_clip->proj_type == PROJECTOR_TYPE_MLP || new_clip->proj_type == PROJECTOR_TYPE_MLP_NORM) {
-            vision_model.mm_0_w              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "weight"));
-            vision_model.mm_0_b              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "bias"));
+        if (new_clip->proj_type == PROJECTOR_TYPE_MLP || new_clip->proj_type == PROJECTOR_TYPE_MLP_NORM || new_clip->proj_type == PROJECTOR_TYPE_MLP_DOWNSAMPLE) {
+            try {
+                vision_model.mm_0_w              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "weight"));
+                vision_model.mm_0_b              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "bias"));
+            } catch (std::runtime_error & /*e*/) { }
             try {
                 // Yi-type llava
                 vision_model.mm_1_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 1, "weight"));
@@ -2617,6 +2687,9 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     }
     if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM) {
         return ctx->vision_model.mm_3_b->ne[0];
+    }
+    if (ctx->proj_type == PROJECTOR_TYPE_MLP_DOWNSAMPLE) {
+        return ctx->vision_model.mm_4_b->ne[0];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {
         if (ctx->minicpmv_version == 2) {

@@ -413,7 +413,7 @@ import re
 
 import numpy as np
 from gguf import *
-from transformers.models.idefics2.modeling_idefics2 import Idefics2VisionTransformer, Idefics2VisionConfig
+# from transformers.models.idefics2.modeling_idefics2 import Idefics2VisionTransformer, Idefics2VisionConfig
 
 TEXT = "clip.text"
 VISION = "clip.vision"
@@ -448,6 +448,8 @@ def get_tensor_name(name: str) -> str:
         return name
     if "mm_projector" in name:
         name = name.replace("model.mm_projector", "mm")
+        name = name.replace("mm_projector", "mm")
+        name = name.replace("layers.", "")
         name = re.sub(r'mm\.mlp\.mlp', 'mm.model.mlp', name, count=1)
         name = re.sub(r'mm\.peg\.peg', 'mm.model.peg', name, count=1)
         return name
@@ -493,7 +495,8 @@ ap.add_argument("--clip-model-is-vision", action="store_true", required=False,
 ap.add_argument("--clip-model-is-openclip", action="store_true", required=False,
                 help="The clip model is from openclip (for ViT-SO400M type))")
 ap.add_argument("--minicpmv-projector", help="Path to minicpmv.projector file. If specified, save an image encoder for MiniCPM-V models.")
-ap.add_argument("--projector-type", help="Type of projector. Possible values: mlp, ldp, ldpv2", choices=["mlp", "ldp", "ldpv2"], default="mlp")
+ap.add_argument("--llava-projector", help="Path to minicpmv.projector file. If specified, save an image encoder for LLaVA models.")
+ap.add_argument("--projector-type", help="Type of projector. Possible values: mlp, ldp, ldpv2, mlp_downsample", choices=["mlp", "ldp", "ldpv2", "mlp_downsample"], default="mlp")
 ap.add_argument("-o", "--output-dir", help="Directory to save GGUF files. Default is the original model directory", default=None)
 # Example --image_mean 0.48145466 0.4578275 0.40821073 --image_std 0.26862954 0.26130258 0.27577711
 # Example --image_mean 0.5 0.5 0.5 --image_std 0.5 0.5 0.5
@@ -502,6 +505,7 @@ default_image_std = [0.26862954, 0.26130258, 0.27577711]
 ap.add_argument('--image-mean', type=float, nargs='+', help='Mean of the images for normalization (overrides processor) ', default=None)
 ap.add_argument('--image-std', type=float, nargs='+', help='Standard deviation of the images for normalization (overrides processor)', default=None)
 ap.add_argument('--minicpmv_version', type=int, help='minicpmv_version: MiniCPM-V-2 use 1; MiniCPM-V-2.5 use 2; MiniCPM-V-2.6 use 3', default=2)
+ap.add_argument('--model-type', type=str, help='model-type: minicpmv or vila', default='minicpmv')
 
 # with proper
 args = ap.parse_args()
@@ -545,7 +549,9 @@ if args.use_f32:
 
 minicpmv_version = args.minicpmv_version
 emb_dim = 4096
-if minicpmv_version == 1:
+if args.model_type == "vila":
+    emb_dim = 1152
+elif minicpmv_version == 1:
     emb_dim = 2304
 elif minicpmv_version == 2:
     emb_dim = 4096
@@ -562,23 +568,29 @@ default_vision_config = {
         "patch_size": 14,
     }
 
-vision_config = Idefics2VisionConfig(**default_vision_config)
-model = Idefics2VisionTransformer(vision_config)
-if minicpmv_version == 3:
+if args.model_type == "vila":
+    default_vision_config['image_size'] = 384
+
+if minicpmv_version == 3 or args.model_type == "vila":
     vision_config = SiglipVisionConfig(**default_vision_config)
     model = SiglipVisionTransformer(vision_config)
+else:
+    vision_config = Idefics2VisionConfig(**default_vision_config)
+    model = Idefics2VisionTransformer(vision_config)
+
 
 processor = None
 # if model.attn_pool is not None:
 #     model.attn_pool = torch.nn.Identity()
 
 # model.blocks = model.blocks[:-1]
-model.load_state_dict(torch.load(os.path.join(dir_model, "minicpmv.clip")))
+model.load_state_dict(torch.load(os.path.join(dir_model, f"{args.model_type}.clip")))
 
 fname_middle = None
 has_text_encoder = True
 has_vision_encoder = True
 has_minicpmv_projector = False
+has_llava_projector = False
 
 if args.text_only:
     fname_middle = "text-"
@@ -587,6 +599,11 @@ elif args.minicpmv_projector is not None:
     fname_middle = "mmproj-"
     has_text_encoder = False
     has_minicpmv_projector = True
+    minicpmv_version = 3
+elif args.llava_projector is not None:
+    fname_middle = "mmproj-"
+    has_text_encoder = False
+    has_llava_projector = True
     minicpmv_version = 3
 elif args.vision_only:
     fname_middle = "vision-"
@@ -602,6 +619,7 @@ fout = GGUFWriter(path=fname_out, arch="clip")
 
 fout.add_bool("clip.has_text_encoder", has_text_encoder)
 fout.add_bool("clip.has_vision_encoder", has_vision_encoder)
+fout.add_bool("clip.has_llava_projector", has_llava_projector)
 fout.add_bool("clip.has_minicpmv_projector", has_minicpmv_projector)
 fout.add_file_type(ftype)
 if args.text_only:
@@ -613,17 +631,21 @@ elif has_minicpmv_projector:
     # add projector type
     fout.add_string("clip.projector_type", "resampler")
     fout.add_int32("clip.minicpmv_version", minicpmv_version)
+elif has_llava_projector:
+    fout.add_description("image encoder for VILA")
+    # add projector type
+    fout.add_string("clip.projector_type", "mlp_downsample")
 else:
     fout.add_description("two-tower CLIP model")
 
 if has_vision_encoder:
     # vision_model hparams
-    fout.add_uint32("clip.vision.image_size", 448)
-    fout.add_uint32("clip.vision.patch_size", 14)
-    fout.add_uint32(add_key_str(KEY_EMBEDDING_LENGTH, VISION), 1152)
-    fout.add_uint32(add_key_str(KEY_FEED_FORWARD_LENGTH, VISION), 4304)
+    fout.add_uint32("clip.vision.image_size", vision_config.image_size)
+    fout.add_uint32("clip.vision.patch_size", vision_config.patch_size)
+    fout.add_uint32(add_key_str(KEY_EMBEDDING_LENGTH, VISION), vision_config.hidden_size)
+    fout.add_uint32(add_key_str(KEY_FEED_FORWARD_LENGTH, VISION), vision_config.intermediate_size)
     fout.add_uint32("clip.vision.projection_dim", 0)
-    fout.add_uint32(add_key_str(KEY_ATTENTION_HEAD_COUNT, VISION), 16)
+    fout.add_uint32(add_key_str(KEY_ATTENTION_HEAD_COUNT, VISION), vision_config.num_attention_heads)
     fout.add_float32(add_key_str(KEY_ATTENTION_LAYERNORM_EPS, VISION), 1e-6)
     block_count = 26
     fout.add_uint32(add_key_str(KEY_BLOCK_COUNT, VISION), block_count)
@@ -713,8 +735,9 @@ def _replace_name_resampler(s, v):
         }
     return {s: v}
 
-if has_minicpmv_projector:
-    projector = torch.load(args.minicpmv_projector)
+if has_minicpmv_projector or has_llava_projector:
+    file_path = args.minicpmv_projector if has_minicpmv_projector else args.llava_projector
+    projector = torch.load(file_path)
     new_state_dict = {}
     for k, v in projector.items():
         kvs = _replace_name_resampler(k, v)

@@ -216,7 +216,9 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
 }
 
 static struct llama_model * llava_init(common_params * params) {
-    llama_backend_init();
+    
+    
+    ();
     llama_numa_init(params->numa);
 
     llama_model_params model_params = common_model_params_to_llama(*params);
